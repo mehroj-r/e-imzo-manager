@@ -6,7 +6,22 @@ A community fork of [Xinux's E-IMZO Manager](https://github.com/xinux-org/e-imzo
 
 ## Installation
 
-The first GitHub release is being prepared. A verified, copyable installation command will be added here after the public release assets pass validation.
+Install [v1.3.0-arch.1](https://github.com/mehroj-r/e-imzo-manager/releases/tag/v1.3.0-arch.1) from your ordinary desktop terminal. This downloads the pinned installer to a private temporary file before executing it:
+
+```bash
+(
+  set -eu
+  installer="$(mktemp)"
+  trap 'rm -f -- "$installer"' EXIT
+  curl --fail --show-error --location \
+    --proto '=https' --proto-redir '=https' \
+    'https://github.com/mehroj-r/e-imzo-manager/releases/download/v1.3.0-arch.1/install.sh' \
+    --output "$installer"
+  bash "$installer"
+)
+```
+
+Read `install.sh` before running it if desired. Public release downloads, checksums and the installer's `--dry-run` path have been verified. The release includes a prebuilt manager, source bundle, checksums and sanitized build information; it does not redistribute the Java backend.
 
 The installer will:
 
