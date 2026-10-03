@@ -45,17 +45,28 @@ jobs:
         run: |
           useradd --create-home builder
           chown -R builder:builder "$GITHUB_WORKSPACE"
-          install -d -o builder -g builder "$RUNNER_TEMP/release-assets"
-          runuser -u builder -- bash packaging/build-release.sh "$RELEASE_TAG" "$RUNNER_TEMP/release-assets"
+          install -d -o builder -g builder .release-build/assets
+          runuser -u builder -- bash packaging/build-release.sh "$RELEASE_TAG" .release-build/assets
+      - name: Assert the complete public asset allowlist
+        run: |
+          python - <<'PY'
+          import pathlib
+          root = pathlib.Path('.release-build/assets')
+          expected = {'e-imzo-manager-1.3.0-1-x86_64.pkg.tar.zst', 'install.sh', 'SHA256SUMS', 'build-info.json', 'e-imzo-manager-1.3.0-arch.1-sources.tar.zst'}
+          if {p.name for p in root.iterdir()} != expected or any(p.is_symlink() or not p.is_file() for p in root.iterdir()):
+              raise SystemExit('Missing or unexpected release assets before upload')
+          PY
       - name: Retain only the validated public asset allowlist
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: arch-release-${{ github.sha }}
           retention-days: 7
           if-no-files-found: error
+          # The ignored staging directory is dot-prefixed; paths remain explicit.
+          include-hidden-files: true
           path: |
-            ${{ runner.temp }}/release-assets/e-imzo-manager-1.3.0-1-x86_64.pkg.tar.zst
-            ${{ runner.temp }}/release-assets/install.sh
-            ${{ runner.temp }}/release-assets/SHA256SUMS
-            ${{ runner.temp }}/release-assets/build-info.json
-            ${{ runner.temp }}/release-assets/e-imzo-manager-1.3.0-arch.1-sources.tar.zst
+            .release-build/assets/e-imzo-manager-1.3.0-1-x86_64.pkg.tar.zst
+            .release-build/assets/install.sh
+            .release-build/assets/SHA256SUMS
+            .release-build/assets/build-info.json
+            .release-build/assets/e-imzo-manager-1.3.0-arch.1-sources.tar.zst
