@@ -55,7 +55,7 @@ impl AsyncComponent for WelcomeModel {
             } else {
                 gtk::LinkButton {
                     set_label: &gettext("Please download e-imzo service and relaunch the app again."),
-                    set_uri: "https://search.nixos.org/packages?channel=unstable&query=e-imzo&show=e-imzo",
+                    set_uri: "https://github.com/mehroj-r/e-imzo-manager#installation",
                 }
             },
         }

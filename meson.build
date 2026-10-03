@@ -3,7 +3,7 @@ project(
   'rust',
   version: '1.3.0',
   meson_version: '>= 1.10.1',
-  license: 'GPL_2_0_ONLY',
+  license: 'AGPL-3.0',
 )
 
 i18n = import('i18n')
@@ -11,9 +11,10 @@ gnome = import('gnome')
 
 base_id = 'uz.xinux.EIMZOManager'
 
-dependency('glib-2.0', version: '>= 2.86.3')
-dependency('gio-2.0', version: '>= 2.86.3')
-dependency('gtk4', version: '>= 4.20.3')
+dependency('glib-2.0', version: '>= 2.88')
+dependency('gio-2.0', version: '>= 2.88')
+dependency('gtk4', version: '>= 4.22')
+dependency('libadwaita-1', version: '>= 1.9')
 
 find_program('glib-compile-resources')
 glib_compile_schemas = find_program('glib-compile-schemas')

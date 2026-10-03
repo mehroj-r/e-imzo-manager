@@ -8,7 +8,13 @@
 *.ui.in~
 *.ui~
 /.flatpak/
-/vendor
+/vendor/*
+!/vendor/e-imzo/
+/dist/
+/.release-build/
+/.release-test/
+__pycache__/
+*.pyc
 /.vscode
 .flatpak-builder/
 flatpak_app

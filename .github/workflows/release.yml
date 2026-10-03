@@ -1,0 +1,73 @@
+name: Native Arch release
+
+on:
+  push:
+    tags: ['v*-arch.*']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # Build directly from this trusted tag, not an artifact from a PR or other run.
+  build:
+    if: github.repository == 'mehroj-r/e-imzo-manager'
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+  publish:
+    needs: build
+    if: github.repository == 'mehroj-r/e-imzo-manager' && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download this run's exact validated asset set
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: ${{ needs.build.outputs.artifact_name }}
+          path: release-assets
+      - name: Verify asset allowlist and source provenance before publishing
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+          SOURCE_COMMIT: ${{ github.sha }}
+        run: |
+          test "$RELEASE_TAG" = v1.3.0-arch.1
+          python3 - <<'PY'
+          import hashlib, json, os, pathlib, re
+          root = pathlib.Path('release-assets')
+          expected = {'e-imzo-manager-1.3.0-1-x86_64.pkg.tar.zst', 'install.sh', 'SHA256SUMS', 'build-info.json', 'e-imzo-manager-1.3.0-arch.1-sources.tar.zst'}
+          if {p.name for p in root.iterdir()} != expected or any(p.is_symlink() or not p.is_file() for p in root.iterdir()):
+              raise SystemExit('Unexpected release assets')
+          info = json.loads((root / 'build-info.json').read_text())
+          if info['source_commit'] != os.environ['SOURCE_COMMIT'] or info['release_tag'] != os.environ['RELEASE_TAG'] or info['source_snapshot'] != 'tracked-commit':
+              raise SystemExit('Release source provenance mismatch')
+          checksums = {}
+          for line in (root / 'SHA256SUMS').read_text().splitlines():
+              match = re.fullmatch(r'([0-9a-f]{64})  ([A-Za-z0-9._-]+)', line)
+              if not match or match[2] in checksums:
+                  raise SystemExit('Invalid checksum manifest')
+              checksums[match[2]] = match[1]
+          if set(checksums) != expected - {'SHA256SUMS'}:
+              raise SystemExit('Checksum asset allowlist mismatch')
+          for name, checksum in checksums.items():
+              if hashlib.sha256((root / name).read_bytes()).hexdigest() != checksum:
+                  raise SystemExit(f'Checksum mismatch: {name}')
+          if checksums['e-imzo-manager-1.3.0-1-x86_64.pkg.tar.zst'] not in (root / 'install.sh').read_text():
+              raise SystemExit('Installer lacks the actual manager checksum')
+          PY
+      - name: Publish the explicit native manager and source assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          gh release create "$RELEASE_TAG" --verify-tag --title "$RELEASE_TAG" \
+            --notes 'Native x86_64 package for up-to-date Arch/Omarchy. Read the versioned README before installing. The source bundle contains the modified SDK, locked registry sources and offline Cargo configuration. The proprietary backend is not redistributed; the installer fetches the unchanged, checksum-pinned vendor payload directly from its vendor.' \
+            release-assets/e-imzo-manager-1.3.0-1-x86_64.pkg.tar.zst \
+            release-assets/install.sh release-assets/SHA256SUMS \
+            release-assets/build-info.json \
+            release-assets/e-imzo-manager-1.3.0-arch.1-sources.tar.zst

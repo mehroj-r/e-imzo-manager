@@ -2,6 +2,7 @@
 <component type="desktop-application">
   <id>@app-id@</id>
   <metadata_license>CC-BY-4.0</metadata_license>
+  <project_license>AGPL-3.0-only</project_license>
   <name>E-IMZO Manager</name>
   <summary>Improving E-IMZO support and compatibility for Linux</summary>
   <description>
@@ -13,8 +14,8 @@
       <caption>Main window</caption>
     </screenshot>
   </screenshots>
-  <url type="homepage">https://github.com/xinux-org/e-imzo-manager</url>
-  <url type="bugtracker">https://github.com/xinux-org/e-imzo-manager/issues</url>
+  <url type="homepage">https://github.com/mehroj-r/e-imzo-manager</url>
+  <url type="bugtracker">https://github.com/mehroj-r/e-imzo-manager/issues</url>
   <url type="translate">https://github.com/xinux-org/e-imzo-manager/tree/main/po</url>
   <developer_name>Xinux Developers</developer_name>
   <update_contact>support@floss.uz</update_contact>

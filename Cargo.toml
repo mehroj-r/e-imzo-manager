@@ -4,8 +4,8 @@ version = "1.3.0"
 edition = "2024"
 license = "AGPL-3.0"
 description = "E-IMZO Manager gtk app for uzbek state web key signing on Linux"
-homepage = "https://git.oss.uzinfocom.uz/xinux/e-imzo-manager"
-repository = "https://git.oss.uzinfocom.uz/xinux/e-imzo-manager"
+homepage = "https://github.com/mehroj-r/e-imzo-manager"
+repository = "https://github.com/mehroj-r/e-imzo-manager"
 authors = ["Xinux Developers <support@oss.uzinfocom.uz>"]
 readme = "README.md"
 
@@ -37,3 +37,10 @@ tokio = { version = "1.52.3", default-features = false, features = [
 e-imzo = "0.4.0"
 uzers = "0.12.2"
 anyhow = "1.0.102"
+
+[dev-dependencies]
+openssl = "0.10.81"
+tungstenite = "0.29.0"
+
+[patch.crates-io]
+e-imzo = { path = "vendor/e-imzo" }

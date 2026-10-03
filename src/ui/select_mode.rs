@@ -4,7 +4,7 @@ use crate::{
         alert::{RemoveCertificateDialog, RemoveCertificateDialogInit},
         window::AppMsg,
     },
-    utils::{ask_password, check_keys_ownership, is_service_active, get_pfx_files_in_folder},
+    utils::{ask_password, check_keys_ownership, get_pfx_files_in_folder, is_service_active},
 };
 use e_imzo::{EIMZO, prelude::Certificate};
 use gettextrs::gettext;

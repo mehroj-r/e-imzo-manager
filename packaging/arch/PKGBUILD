@@ -1,0 +1,89 @@
+# Built only in an isolated Arch builder. Install the resulting package with pacman.
+# makepkg supplies srcdir and pkgdir when sourcing this file.
+# shellcheck disable=SC2154
+pkgname=e-imzo-manager
+pkgver=1.3.0
+pkgrel=1
+pkgdesc='GTK manager for the E-IMZO signing service'
+arch=('x86_64')
+url='https://github.com/mehroj-r/e-imzo-manager'
+license=('AGPL-3.0-only' 'CC-BY-4.0' 'MIT' 'Apache-2.0')
+depends=('gtk4>=1:4.22' 'glib2>=2.88' 'libadwaita>=1.9' 'openssl' 'polkit' 'systemd' 'glibc' 'e-imzo>=6.4.7')
+makedepends=('rust>=1.93' 'cargo' 'meson>=1.10.1' 'ninja' 'pkgconf' 'gettext' 'desktop-file-utils' 'appstream' 'python' 'git' 'binutils')
+options=('!debug' 'strip' '!lto')
+
+# build-release.sh exports a local tracked-source archive and its actual checksum.
+# No moving branch downloads, unchecked sources, or proprietary backend inputs.
+_source_archive=${MANAGER_SOURCE_ARCHIVE:?Set MANAGER_SOURCE_ARCHIVE to the local source archive basename}
+_source_sha256=${MANAGER_SOURCE_SHA256:?Set MANAGER_SOURCE_SHA256 to its SHA-256}
+[[ $_source_archive == "e-imzo-manager-${pkgver}-source.tar.zst" ]] || return 1
+[[ $_source_sha256 =~ ^[0-9a-f]{64}$ ]] || return 1
+source=("$_source_archive")
+sha256sums=("$_source_sha256")
+
+build() {
+  local root="$srcdir/$pkgname-$pkgver"
+  export CARGO_HOME="$root/build/cargo-home"
+  if [[ -n ${MANAGER_CARGO_VENDOR_SEED:-} ]]; then
+    mkdir -p "$CARGO_HOME"
+    cp -a -- "$MANAGER_CARGO_VENDOR_SEED" "$CARGO_HOME/vendor-registry"
+    python - "$CARGO_HOME" <<'PY'
+import json, pathlib, sys
+home = pathlib.Path(sys.argv[1])
+(home / 'config.toml').write_text('[source.crates-io]\nreplace-with = "vendored-sources"\n[source.vendored-sources]\ndirectory = ' + json.dumps(str(home / 'vendor-registry')) + '\n[net]\noffline = true\n')
+PY
+  fi
+  export CARGO_INCREMENTAL=0
+  unset CARGO_ENCODED_RUSTFLAGS CARGO_BUILD_RUSTFLAGS CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS
+  # Do not inherit target-cpu=native or paths from the builder's environment.
+  export RUSTFLAGS="-C debuginfo=0 --remap-path-prefix=$srcdir=/usr/src/e-imzo-manager --remap-path-prefix=$CARGO_HOME=/usr/src/cargo"
+  meson setup "$root/build" "$root" --prefix=/usr --buildtype=release -Dprofile=default
+  meson compile -C "$root/build"
+}
+
+check() {
+  local root="$srcdir/$pkgname-$pkgver"
+  export CARGO_HOME="$root/build/cargo-home"
+  export CARGO_INCREMENTAL=0
+  unset CARGO_ENCODED_RUSTFLAGS CARGO_BUILD_RUSTFLAGS CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS
+  export RUSTFLAGS="-C debuginfo=0 --remap-path-prefix=$srcdir=/usr/src/e-imzo-manager --remap-path-prefix=$CARGO_HOME=/usr/src/cargo"
+  cd "$root" || return 1
+  cargo test --locked --release --all-targets --target-dir "$root/build/src"
+  meson test -C "$root/build" --no-rebuild --print-errorlogs
+  python -m unittest discover -s tests -p 'test_*.py'
+  python packaging/check-tls-regression.py "$root" "$root/build/src"
+}
+
+package() {
+  local root="$srcdir/$pkgname-$pkgver"
+  DESTDIR="$pkgdir" meson install -C "$root/build" --no-rebuild
+  install -Dm644 "$root/LICENSE-AGPL" "$pkgdir/usr/share/licenses/$pkgname/LICENSE-AGPL"
+  install -Dm644 "$root/LICENSE-CCBY" "$pkgdir/usr/share/licenses/$pkgname/LICENSE-CCBY"
+  local notice
+  for notice in LICENSE-MIT LICENSE-APACHE PATCHES.md; do
+    install -Dm644 "$root/vendor/e-imzo/$notice" "$pkgdir/usr/share/licenses/$pkgname/e-imzo/$notice"
+  done
+  # Pacman enforces the actual ELF ABI floor without end-user binutils.
+  local minimum_glibc
+  minimum_glibc=$(readelf --version-info "$pkgdir/usr/bin/$pkgname" | grep -oE 'GLIBC_[0-9]+(\.[0-9]+)+' | sort -Vu | last_symbol_version GLIBC)
+  [[ $minimum_glibc =~ ^[0-9]+(\.[0-9]+)+$ ]]
+  local minimum_openssl
+  minimum_openssl=$(readelf --version-info "$pkgdir/usr/bin/$pkgname" | grep -oE 'OPENSSL_[0-9]+(\.[0-9]+)+' | sort -Vu | last_symbol_version OPENSSL)
+  [[ $minimum_openssl =~ ^[0-9]+(\.[0-9]+)+$ ]]
+  if [[ $(vercmp "$minimum_openssl" 3.0.0) -gt 0 ]]; then
+    printf 'ELF requires OpenSSL %s: update the explicit runtime floor before releasing\n' "$minimum_openssl" >&2
+    return 1
+  fi
+  local -a runtime=()
+  local dependency
+  for dependency in "${depends[@]}"; do
+    [[ $dependency == glibc ]] || runtime+=("$dependency")
+  done
+  depends=("${runtime[@]}" "glibc>=$minimum_glibc")
+}
+
+last_symbol_version() {
+  local prefix=$1 version last=''
+  while IFS= read -r version; do last=${version#"${prefix}_"}; done
+  [[ -n $last ]] && printf '%s\n' "$last"
+}

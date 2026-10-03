@@ -1,0 +1,61 @@
+name: Native Arch CI
+
+on:
+  push:
+    branches: [arch-release]
+  pull_request:
+  workflow_call:
+    outputs:
+      artifact_name:
+        description: Validated native release asset set
+        value: ${{ jobs.build.outputs.artifact_name }}
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container:
+      # Docker Official Image, linux/amd64 manifest verified against the registry.
+      image: archlinux@sha256:eb8f6dcc89a38977c9735f10fcf6ae4afe496283e7008eb7a3420cdba31fbd04
+    outputs:
+      artifact_name: arch-release-${{ github.sha }}
+    steps:
+      # checkout needs git in this minimal image; install it before the action.
+      - name: Provision official Arch compile and validation inputs
+        run: |
+          pacman -Syu --noconfirm --needed base-devel git rust meson ninja pkgconf \
+            gtk4 glib2 libadwaita openssl gettext desktop-file-utils appstream \
+            python shellcheck actionlint libarchive zstd binutils
+      - name: Checkout exact event commit
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+      - name: Lint release and installer scripts
+        run: |
+          shellcheck packaging/*.sh packaging/install.sh.in
+          shellcheck -s bash -e SC2034 packaging/arch/PKGBUILD
+          actionlint .github/workflows/ci.yml .github/workflows/release.yml
+      - name: Build, test, mutate-test and validate one native package
+        env:
+          RELEASE_TAG: v1.3.0-arch.1
+          MANAGER_BUILDER_IMAGE: archlinux@sha256:eb8f6dcc89a38977c9735f10fcf6ae4afe496283e7008eb7a3420cdba31fbd04
+        run: |
+          useradd --create-home builder
+          chown -R builder:builder "$GITHUB_WORKSPACE"
+          install -d -o builder -g builder "$RUNNER_TEMP/release-assets"
+          runuser -u builder -- bash packaging/build-release.sh "$RELEASE_TAG" "$RUNNER_TEMP/release-assets"
+      - name: Retain only the validated public asset allowlist
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: arch-release-${{ github.sha }}
+          retention-days: 7
+          if-no-files-found: error
+          path: |
+            ${{ runner.temp }}/release-assets/e-imzo-manager-1.3.0-1-x86_64.pkg.tar.zst
+            ${{ runner.temp }}/release-assets/install.sh
+            ${{ runner.temp }}/release-assets/SHA256SUMS
+            ${{ runner.temp }}/release-assets/build-info.json
+            ${{ runner.temp }}/release-assets/e-imzo-manager-1.3.0-arch.1-sources.tar.zst

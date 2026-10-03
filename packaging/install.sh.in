@@ -1,0 +1,532 @@
+#!/usr/bin/env bash
+# Version-pinned installer for current x86_64 Arch/Omarchy desktops.
+# Source this locally authored file to test its functions without running main.
+readonly RELEASE_TAG='@RELEASE_TAG@'
+readonly MANAGER_PACKAGE='@MANAGER_PACKAGE@'
+readonly MANAGER_SHA256='@MANAGER_SHA256@'
+readonly RELEASE_BASE="https://github.com/mehroj-r/e-imzo-manager/releases/download/${RELEASE_TAG}"
+readonly BACKEND_URL='https://dls.soliq.uz/v6.4.7/E-IMZO-v6.4.7.tar.gz'
+readonly BACKEND_SHA256='c077152064cd44c8ade4ba877177061a2edfa039a2c0755751cc65e199611a76'
+readonly BACKEND_PACKAGE='e-imzo-backend-6.4.7-1-x86_64.pkg.tar.zst'
+readonly APP_ID='uz.xinux.EIMZOManager'
+
+fail() { printf 'Error: %s\n' "$*" >&2; return 1; }
+note() { printf '%s\n' "$*"; }
+confirm() {
+    local answer
+    printf '%s [y/N] ' "$*" >&2
+    IFS= read -r answer || return 1
+    [[ $answer == y || $answer == Y || $answer == yes || $answer == YES ]]
+}
+
+check_platform() {
+    [[ $(id -u) != 0 ]] || { fail 'Run as your ordinary desktop user, not root or sudo.'; return 1; }
+    [[ $(uname -m) == x86_64 ]] || { fail 'Only x86_64 is supported.'; return 1; }
+    [[ -f /etc/arch-release ]] || { fail 'Only Arch Linux/Omarchy is supported.'; return 1; }
+    [[ ${HOME:-} == /* && $HOME != / && $HOME != *[$'\n\r\t']* ]] || { fail 'A normal absolute HOME is required.'; return 1; }
+}
+
+check_tools() {
+    local tool
+    for tool in bash curl sha256sum bsdtar zstd gzip pacman pacman-conf vercmp \
+        systemctl sudo timeout sleep mktemp mkdir cp mv rm chmod find sort stat du date grep; do
+        command -v "$tool" >/dev/null || { fail "Missing prerequisite: $tool. Install the official Arch package providing it first."; return 1; }
+    done
+}
+
+check_user_bus() {
+    [[ -n ${XDG_RUNTIME_DIR:-} && -d $XDG_RUNTIME_DIR && -O $XDG_RUNTIME_DIR ]] || {
+        fail 'Run inside your normal logged-in desktop session (XDG_RUNTIME_DIR is missing or not owned by you).'; return 1;
+    }
+    systemctl --user show-environment >/dev/null || {
+        fail 'Your user systemd bus is unavailable. Run from your normal desktop session.'; return 1;
+    }
+}
+
+check_signature_policy() {
+    local policy token
+    policy=$(pacman-conf LocalFileSigLevel) || { fail 'Cannot read pacman local signature policy.'; return 1; }
+    if [[ -z $policy ]]; then
+        policy=$(pacman-conf SigLevel) || return 1
+    fi
+    for token in $policy; do
+        case $token in
+            Required|PackageRequired)
+                fail 'LocalFileSigLevel requires signed packages. The locally generated vendor package is unsigned; this installer cannot comply and will not weaken your policy.'
+                return 1 ;;
+        esac
+    done
+    [[ -n $policy ]] || { fail 'Cannot determine pacman signature policy.'; return 1; }
+}
+
+check_template() {
+    [[ $RELEASE_TAG =~ ^v[0-9]+\.[0-9]+\.[0-9]+-arch\.[0-9]+$ &&
+       $MANAGER_PACKAGE == e-imzo-manager-1.3.0-1-x86_64.pkg.tar.zst &&
+       $MANAGER_SHA256 =~ ^[a-f0-9]{64}$ ]] || {
+        fail 'This is an unrendered or invalid installer template. Download install.sh from the pinned release.'; return 1;
+    }
+}
+
+verify_hash() {
+    local actual
+    [[ $2 =~ ^[a-f0-9]{64}$ ]] || { fail 'Invalid expected SHA-256.'; return 1; }
+    actual=$(sha256sum -- "$1") || return 1
+    [[ ${actual%% *} == "$2" ]] || { fail "SHA-256 mismatch: $1. Nothing has been installed."; return 1; }
+}
+
+download() {
+    curl --fail --show-error --location --proto '=https' --proto-redir '=https' \
+        --tlsv1.2 --connect-timeout 30 --max-time 600 --retry 2 --output "$2" "$1"
+}
+
+# LC_ALL=C bsdtar escapes nonprinting bytes; the narrow ASCII grammar also
+# rejects those escaped names, whitespace and backslashes. Match BOTH listings,
+# including entry types, before extracting anything. Never trust tar -t alone.
+validate_archive() {
+    local archive=$1 kind=$2 listings=$3 raw name line mode verbose_name count=0
+    local -a names=()
+    local -A seen=()
+    LC_ALL=C bsdtar -tf "$archive" > "$listings.names" || { fail 'Archive listing failed.'; return 1; }
+    LC_ALL=C bsdtar -tvf "$archive" > "$listings.types" || { fail 'Archive type listing failed.'; return 1; }
+    while IFS= read -r raw; do
+        [[ $raw =~ ^[A-Za-z0-9._+/@-]+$ ]] || { fail "Unsafe archive name: $raw"; return 1; }
+        name=$raw
+        if [[ $kind == manager && $name == ./* ]]; then name=${name#./}; fi
+        name=${name%/}
+        [[ -n $name && $name != /* && $name != . && $name != .. &&
+           /$name/ != */../* && /$name/ != */./* && $name != *//* ]] || {
+            fail "Unsafe archive path: $raw"; return 1;
+        }
+        [[ ! ${seen[$name]+present} ]] || { fail "Duplicate archive path: $name"; return 1; }
+        seen[$name]=1
+        case $kind in
+            backend)
+                case $name in
+                    E-IMZO|E-IMZO/lib|E-IMZO/E-IMZO.jar|E-IMZO/E-IMZO.sh|E-IMZO/E-IMZO.pem|E-IMZO/README.txt) ;;
+                    E-IMZO/lib/*.jar)
+                        [[ ${name#E-IMZO/lib/} != */* ]] || { fail "Unexpected vendor path: $name"; return 1; } ;;
+                    *) fail "Unexpected vendor path: $name"; return 1 ;;
+                esac ;;
+            manager)
+                case $name in
+                    .PKGINFO|.BUILDINFO|.MTREE|usr|usr/*) ;;
+                    *) fail "Unexpected manager path: $name"; return 1 ;;
+                esac
+                case $name in
+                    */gschemas.compiled|*/icon-theme.cache|*/mimeinfo.cache)
+                        fail "Package ships a shared cache: $name"; return 1 ;;
+                esac ;;
+            *) fail 'Unknown archive kind.'; return 1 ;;
+        esac
+        names+=("$raw")
+    done < "$listings.names"
+    ((${#names[@]} > 0)) || { fail 'Empty archive.'; return 1; }
+    while IFS= read -r line; do
+        IFS=' ' read -r mode _ _ _ _ _ _ _ verbose_name <<< "$line"
+        [[ $count -lt ${#names[@]} && $verbose_name == "${names[$count]}" ]] || {
+            fail 'Archive names/types disagree or contain an unsafe name.'; return 1;
+        }
+        raw=${names[$count]}
+        case ${mode:0:1} in
+            d) [[ $raw == */ ]] || { fail "Directory missing trailing slash: $raw"; return 1; } ;;
+            -) [[ $raw != */ ]] || { fail "File masquerades as directory: $raw"; return 1; } ;;
+            *) fail "Links and special archive entries are forbidden: $raw"; return 1 ;;
+        esac
+        [[ $mode != *s* && $mode != *S* && $mode != *t* && $mode != *T* ]] || {
+            fail "Special permission bits are forbidden: $raw"; return 1;
+        }
+        # Allowed vendor directories must actually be directories, not files.
+        if [[ $kind == backend ]]; then
+            name=${raw%/}
+            if [[ $name == E-IMZO || $name == E-IMZO/lib ]]; then
+                [[ ${mode:0:1} == d ]] || { fail 'Invalid vendor directory type.'; return 1; }
+            else
+                [[ ${mode:0:1} == - ]] || { fail 'Invalid vendor payload type.'; return 1; }
+            fi
+        fi
+        ((count+=1))
+    done < "$listings.types"
+    [[ $count == "${#names[@]}" ]] || { fail 'Incomplete archive type listing.'; return 1; }
+    if [[ $kind == backend ]]; then
+        for name in E-IMZO E-IMZO/lib E-IMZO/E-IMZO.jar E-IMZO/E-IMZO.sh E-IMZO/E-IMZO.pem E-IMZO/README.txt; do
+            [[ ${seen[$name]+present} ]] || { fail "Missing vendor payload: $name"; return 1; }
+        done
+    else
+        [[ ${seen[.PKGINFO]+present} && ${seen[usr/bin/e-imzo-manager]+present} ]] || {
+            fail 'Manager package is missing metadata or binary.'; return 1;
+        }
+    fi
+}
+
+extract_archive() {
+    mkdir -p -- "$2" || return 1
+    bsdtar -xf "$1" -C "$2" --no-same-owner --no-same-permissions \
+        --no-acls --no-xattrs --no-fflags || return 1
+}
+
+# The release builder derives glibc's floor from ELF version requirements and
+# encodes it as a versioned dependency; no binutils or compiler is needed here.
+read_manager_metadata() {
+    local key value name version arch glibc_floor=0 gtk_floor=0 glib_floor=0 adw_floor=0 backend_dep=0
+    MANAGER_DEPENDENCIES=()
+    while IFS= read -r line; do
+        [[ $line == *=* ]] || continue
+        key=${line%% = *}; value=${line#* = }
+        case $key in
+            pkgname) [[ -z ${name:-} ]] || return 1; name=$value ;;
+            pkgver) [[ -z ${version:-} ]] || return 1; version=$value ;;
+            arch) [[ -z ${arch:-} ]] || return 1; arch=$value ;;
+            install) fail 'Manager install scripts are forbidden.'; return 1 ;;
+            depend)
+                [[ $value =~ ^[a-z0-9@._+-]+([\<\>]=?|=)?[a-zA-Z0-9:.+_~-]*$ ]] || { fail "Unsupported dependency: $value"; return 1; }
+                case $value in
+                    glibc\>=*) glibc_floor=1 ;;
+                    gtk4\>=*) [[ $(vercmp "${value#gtk4>=}" 1:4.22) -ge 0 ]] && gtk_floor=1 ;;
+                    glib2\>=*) [[ $(vercmp "${value#glib2>=}" 2.88) -ge 0 ]] && glib_floor=1 ;;
+                    libadwaita\>=*) [[ $(vercmp "${value#libadwaita>=}" 1.9) -ge 0 ]] && adw_floor=1 ;;
+                    e-imzo|e-imzo\>=6.4.7|e-imzo=6.4.7) backend_dep=1; continue ;;
+                esac
+                MANAGER_DEPENDENCIES+=("$value") ;;
+        esac
+    done < "$1/.PKGINFO"
+    [[ ${name:-} == e-imzo-manager && ${version:-} == 1.3.0-1 && ${arch:-} == x86_64 &&
+       $glibc_floor == 1 && $gtk_floor == 1 && $glib_floor == 1 && $adw_floor == 1 && $backend_dep == 1 ]] || {
+        fail 'Manager package identity/runtime floors are invalid (including the ELF-derived glibc minimum).'; return 1;
+    }
+}
+
+version_satisfies() {
+    local comparison
+    [[ -z $2 ]] && return 0
+    comparison=$(vercmp "$1" "$3") || return 1
+    case $2 in
+        '>=' ) [[ $comparison -ge 0 ]] ;;
+        '>' ) [[ $comparison -gt 0 ]] ;;
+        '=' ) [[ $comparison -eq 0 ]] ;;
+        '<=' ) [[ $comparison -le 0 ]] ;;
+        '<' ) [[ $comparison -lt 0 ]] ;;
+        *) return 1 ;;
+    esac
+}
+
+check_runtime_requirements() {
+    local dep name op required query installed repo line candidate
+    local -A visited=()
+    MISSING_DEPENDENCIES=()
+    for dep in "${MANAGER_DEPENDENCIES[@]}" jre17-openjdk pcsclite libusb; do
+        [[ ! ${visited[$dep]+present} ]] || continue
+        visited[$dep]=1
+        # Ask pacman's native dependency resolver first: an installed provider
+        # (notably jdk17-openjdk providing jre17-openjdk) already satisfies the
+        # dependency and must not be replaced with its physical package name.
+        if pacman -T -- "$dep" >/dev/null 2>&1; then continue; fi
+        [[ $dep =~ ^([a-z0-9@._+-]+)([\<\>]=?|=)?(.*)$ ]] || return 1
+        name=${BASH_REMATCH[1]}; op=${BASH_REMATCH[2]}; required=${BASH_REMATCH[3]}
+        if query=$(pacman -Q "$name" 2>/dev/null); then
+            installed=${query#* }
+            version_satisfies "$installed" "$op" "$required" || {
+                fail "$name $installed does not satisfy $dep. Update your Arch system deliberately (full pacman -Syu), then rerun. This installer will not perform a partial or blanket upgrade."; return 1;
+            }
+        else
+            repo=$(LC_ALL=C pacman -Si "$name") || { fail "Official repository dependency unavailable: $name. Update your system/repository databases deliberately, then rerun."; return 1; }
+            candidate=''
+            while IFS= read -r line; do
+                if [[ $line =~ ^Version[[:space:]]*:[[:space:]]+([^[:space:]]+)$ ]]; then candidate=${BASH_REMATCH[1]}; break; fi
+            done <<< "$repo"
+            if [[ -z $candidate ]] || ! version_satisfies "$candidate" "$op" "$required"; then
+                fail "Repository $name does not satisfy $dep. Update your Arch system deliberately, then rerun."; return 1
+            fi
+            MISSING_DEPENDENCIES+=("$dep")
+        fi
+    done
+}
+
+build_backend_package() {
+    local vendor=$1 stage=$2 output=$3 size
+    mkdir -p "$stage/usr/share/e-imzo" "$stage/usr/bin" "$stage/usr/lib/systemd/user" || return 1
+    cp -R -- "$vendor/E-IMZO/." "$stage/usr/share/e-imzo/" || return 1
+    # Preserve every vendor file's contents, including its unused shell script.
+    # Only our own wrapper is executable; vendor scripts are never run.
+    find "$stage" -type d -exec chmod 755 {} + || return 1
+    find "$stage" -type f -exec chmod 644 {} + || return 1
+    printf '%s\n' '#!/usr/bin/env bash' 'cd /usr/share/e-imzo || exit 1' \
+        'exec /usr/lib/jvm/java-17-openjdk/bin/java -jar /usr/share/e-imzo/E-IMZO.jar "$@"' > "$stage/usr/bin/e-imzo"
+    chmod 755 "$stage/usr/bin/e-imzo" || return 1
+    printf '%s\n' '[Unit]' 'Description=E-IMZO signing backend' '' '[Service]' \
+        'Type=simple' 'WorkingDirectory=/usr/share/e-imzo' \
+        'ExecStart=/usr/lib/jvm/java-17-openjdk/bin/java -jar /usr/share/e-imzo/E-IMZO.jar' \
+        'Restart=on-failure' 'RestartSec=5' '' '[Install]' 'WantedBy=default.target' \
+        > "$stage/usr/lib/systemd/user/e-imzo.service"
+    size=$(du -sb "$stage/usr") || return 1
+    size=${size%%[[:space:]]*}
+    printf '%s\n' 'pkgname = e-imzo-backend' 'pkgbase = e-imzo-backend' 'pkgver = 6.4.7-1' \
+        'pkgdesc = Official E-IMZO vendor payload, packaged locally without modification' \
+        'url = https://e-imzo.soliq.uz/' "builddate = $(date +%s)" \
+        'packager = Local installation' "size = $size" 'arch = x86_64' \
+        'license = custom:vendor' 'depend = jre17-openjdk' 'depend = pcsclite' 'depend = libusb' \
+        'provides = e-imzo=6.4.7' 'conflict = e-imzo' 'conflict = e-imzo-bin' > "$stage/.PKGINFO"
+    # main's private umask must not make the root-owned installed user unit
+    # unreadable to the user systemd manager.
+    chmod 644 "$stage/.PKGINFO" "$stage/usr/lib/systemd/user/e-imzo.service" || return 1
+    # uid/gid are encoded as root without ever using chown or running as root.
+    bsdtar -cf - --format=mtree --options='!all,use-set,type,uid,gid,mode,time,size,sha256' \
+        --uid 0 --gid 0 -C "$stage" .PKGINFO usr | gzip -n > "$stage/.MTREE" || return 1
+    chmod 644 "$stage/.MTREE" || return 1
+    bsdtar -cf - --format=pax --uid 0 --gid 0 --uname root --gname root \
+        -C "$stage" .PKGINFO .MTREE usr | zstd -q -T0 -o "$output" || return 1
+}
+
+capture_service_state() {
+    SERVICE_EXISTED=0
+    SERVICE_ACTIVE=0
+    SERVICE_ENABLED=$(systemctl --user is-enabled e-imzo.service 2>/dev/null) || :
+    local load
+    load=$(systemctl --user show e-imzo.service --property=LoadState --value) || return 1
+    if [[ $load != not-found && -n $load ]]; then SERVICE_EXISTED=1; fi
+    if pacman -Q e-imzo-backend >/dev/null 2>&1 || pacman -Q e-imzo >/dev/null 2>&1 || pacman -Q e-imzo-bin >/dev/null 2>&1; then SERVICE_EXISTED=1; fi
+    if systemctl --user is-active --quiet e-imzo.service; then SERVICE_ACTIVE=1; fi
+}
+
+install_packages() {
+    local manager=$1 backend=$2
+    if ((${#MISSING_DEPENDENCIES[@]})); then
+        note "Official repository dependencies needed: ${MISSING_DEPENDENCIES[*]}"
+        sudo pacman -S --needed -- "${MISSING_DEPENDENCIES[@]}" || { fail 'Dependency transaction failed; no local packages or user setup were attempted.'; return 1; }
+    fi
+    note 'Installing manager and locally packaged backend together. Review pacman conflicts and confirm any replacement yourself.'
+    sudo pacman -U -- "$manager" "$backend" || {
+        fail 'Package transaction failed. No user files or services have been changed by the installer.'; return 1;
+    }
+}
+
+# Never traverse symlinked parents when migrating a user-local shadow artifact.
+parents_are_real() {
+    local parent=${1%/*}
+    while [[ $parent != / ]]; do
+        [[ ! -L $parent ]] || return 1
+        parent=${parent%/*}; [[ -n $parent ]] || parent=/
+    done
+}
+
+find_local_shadows() {
+    local path
+    LOCAL_SHADOWS=()
+    local -a candidates=(
+        "$HOME/.local/bin/e-imzo-manager"
+        "$HOME/.local/share/e-imzo-manager/resources.gresource"
+        "$HOME/.local/share/applications/$APP_ID.desktop"
+        "$HOME/.local/share/metainfo/$APP_ID.metainfo.xml"
+        "$HOME/.local/share/glib-2.0/schemas/$APP_ID.gschema.xml"
+        "$HOME/.local/share/icons/hicolor/scalable/apps/$APP_ID.svg"
+        "$HOME/.local/share/icons/hicolor/symbolic/apps/$APP_ID-symbolic.svg"
+    )
+    # Only this app's translation file, never a locale directory or other app.
+    for path in "$HOME"/.local/share/locale/*/LC_MESSAGES/e-imzo-manager.mo; do candidates+=("$path"); done
+    for path in "${candidates[@]}"; do
+        if [[ -e $path || -L $path ]]; then
+            if [[ ! -f $path && ! -L $path ]] || ! parents_are_real "$path"; then
+                fail "Unsafe local shadow artifact (directory or symlinked parent), refusing migration: $path"; return 1
+            fi
+            LOCAL_SHADOWS+=("$path")
+        fi
+    done
+}
+
+refresh_local_caches() {
+    local base=$HOME/.local/share
+    if [[ ${DESKTOP_CACHE_CHANGED:-0} == 1 && -d $base/applications ]] && command -v update-desktop-database >/dev/null; then
+        parents_are_real "$base/applications/.cache" || { fail 'Refusing cache update through a symlinked directory.'; return 1; }
+        update-desktop-database "$base/applications" || return 1
+    fi
+    if [[ ${ICON_CACHE_CHANGED:-0} == 1 && -d $base/icons/hicolor ]] && command -v gtk-update-icon-cache >/dev/null; then
+        parents_are_real "$base/icons/hicolor/.cache" || { fail 'Refusing cache update through a symlinked directory.'; return 1; }
+        gtk-update-icon-cache -f -t "$base/icons/hicolor" || return 1
+    fi
+    # gschemas.compiled may contain unrelated applications: never modify it.
+}
+
+restore_local_shadows() {
+    local index original saved failed=0
+    for ((index=${#MOVED_ORIGINALS[@]}-1; index>=0; index--)); do
+        original=${MOVED_ORIGINALS[$index]}; saved=${MOVED_BACKUPS[$index]}
+        if [[ ! -e $saved && ! -L $saved ]]; then
+            # mv did not complete, so the original has not been moved.
+            continue
+        elif [[ -e $original || -L $original ]]; then
+            printf 'Restore blocked by an existing file: %s (backup: %s)\n' "$original" "$saved" >&2
+            failed=1
+        elif ! parents_are_real "$original" || ! mv -- "$saved" "$original"; then
+            printf 'Restore failed: %s -> %s\n' "$saved" "$original" >&2
+            failed=1
+        fi
+    done
+    if ((${#MOVED_ORIGINALS[@]})); then
+        refresh_local_caches || { note 'Could not refresh local caches after restoration; files were preserved.' >&2; failed=1; }
+        note "Migration rollback attempted. Recorded backup: $BACKUP_DIR" >&2
+    fi
+    MOVED_ORIGINALS=(); MOVED_BACKUPS=()
+    return "$failed"
+}
+
+migrate_local_shadows() {
+    local original relative saved
+    ((${#LOCAL_SHADOWS[@]})) || return 0
+    note 'These exact user-local manager files can shadow the new system package:'
+    printf '  %s\n' "${LOCAL_SHADOWS[@]}"
+    note 'Preferences, keys, backend configuration, directories and shared schema caches will not be moved.'
+    note 'Only affected user desktop/icon caches will be refreshed. Shared compiled schemas are preserved.'
+    confirm 'Back up ONLY these files now?' || { note 'Local migration declined. These files may still shadow the system launcher.'; return 0; }
+    BACKUP_DIR="$HOME/.local/state/e-imzo-manager/migration-$(date -u +%Y%m%dT%H%M%SZ)-$$"
+    parents_are_real "$BACKUP_DIR/manifest.txt" || { fail 'Backup parent is a symlink; refusing migration.'; return 1; }
+    mkdir -p -- "$BACKUP_DIR" || return 1
+    chmod 700 "$BACKUP_DIR" || return 1
+    : > "$BACKUP_DIR/manifest.txt"
+    for original in "${LOCAL_SHADOWS[@]}"; do
+        if [[ ! -f $original && ! -L $original ]] || ! parents_are_real "$original"; then
+            fail "Shadow changed before backup: $original"; return 1
+        fi
+        relative=${original#"$HOME/"}; saved=$BACKUP_DIR/$relative
+        mkdir -p -- "${saved%/*}" || return 1
+        printf '%s\t%s\n' "$original" "$saved" >> "$BACKUP_DIR/manifest.txt" || return 1
+        # Record before mv so an interruption cannot strand an unrecorded file.
+        MOVED_ORIGINALS+=("$original"); MOVED_BACKUPS+=("$saved")
+        case $relative in
+            .local/share/applications/*) DESKTOP_CACHE_CHANGED=1 ;;
+            .local/share/icons/hicolor/*) ICON_CACHE_CHANGED=1 ;;
+        esac
+        mv -- "$original" "$saved" || return 1
+    done
+    note "Backup recorded at: $BACKUP_DIR/manifest.txt"
+    note 'To restore later, move each recorded backup to its original path, without overwriting any newer file.'
+    refresh_local_caches || { fail 'Local cache refresh failed; the exit handler will restore the backed-up files.'; return 1; }
+}
+
+backend_port_ready() {
+    # A connection probe only, never an HTTP/TLS request or certificate bypass.
+    # Type=simple is active before the JVM has bound its socket. Bound even the
+    # individual TCP connect so a broken local network cannot hang the installer.
+    timeout --kill-after=1 1 bash -c 'exec 3<>/dev/tcp/127.0.0.1/64443' >/dev/null 2>&1
+}
+
+wait_for_backend() {
+    local maximum=${1:-30} started=$SECONDS state
+    [[ $maximum =~ ^[0-9]+$ ]] || { fail 'Invalid internal readiness timeout.'; return 1; }
+    note "Waiting up to ${maximum}s for E-IMZO at 127.0.0.1:64443..."
+    while ((SECONDS - started < maximum)); do
+        state=$(systemctl --user show e-imzo.service --property=ActiveState --value) || {
+            fail 'Cannot inspect the E-IMZO user service; manager was not launched.'; return 1;
+        }
+        case $state in
+            active|activating|reloading) ;;
+            *)
+                systemctl --user --no-pager status e-imzo.service || :
+                fail "E-IMZO user service entered ${state:-unknown} state before becoming ready. Manager was not launched. Inspect: systemctl --user status e-imzo.service"
+                return 1 ;;
+        esac
+        if [[ $state == active ]] && backend_port_ready; then
+            note 'E-IMZO local backend socket is ready.'
+            return 0
+        fi
+        sleep 0.2 || return 1
+    done
+    systemctl --user --no-pager status e-imzo.service || :
+    fail "E-IMZO did not listen on 127.0.0.1:64443 within ${maximum}s. Manager was not launched. Inspect: journalctl --user -u e-imzo.service"
+    return 1
+}
+
+activate_service() {
+    local started=0
+    systemctl --user daemon-reload || return 1
+    if [[ $SERVICE_EXISTED == 0 ]]; then
+        if confirm 'Enable and start E-IMZO for your user (including future logins)?'; then
+            systemctl --user enable --now e-imzo.service || return 1
+            started=1
+        else
+            note 'Autostart/start declined. Later: systemctl --user enable --now e-imzo.service'
+        fi
+    elif [[ $SERVICE_ENABLED == masked || $SERVICE_ENABLED == masked-runtime ]]; then
+        note 'Existing masked service preserved; it was not enabled or started.'
+    elif [[ $SERVICE_ACTIVE == 1 ]]; then
+        systemctl --user restart e-imzo.service || return 1
+        started=1
+    else
+        note "Existing service state preserved (${SERVICE_ENABLED:-disabled}, inactive); it was not enabled or started."
+    fi
+    if [[ $started == 1 ]]; then wait_for_backend || return 1; fi
+    systemctl --user --no-pager status e-imzo.service || : # inactive status is informational
+}
+
+launch_manager() {
+    note 'System manager command: /usr/bin/e-imzo-manager'
+    [[ $NO_LAUNCH == 0 && ( -n ${WAYLAND_DISPLAY:-} || -n ${DISPLAY:-} ) ]] || return 0
+    confirm 'Launch the system manager now?' || return 0
+    # A user-local desktop entry may have been retained, so launch the absolute
+    # packaged executable rather than letting gtk-launch resolve a shadow.
+    /usr/bin/e-imzo-manager >/dev/null 2>&1 &
+    note 'Manager launch requested. Browser certificates/key setup remain separate; no keys or settings were changed.'
+}
+
+cleanup_installer() {
+    local status=$1
+    trap - EXIT
+    if [[ $status != 0 ]]; then restore_local_shadows || :; fi
+    [[ -z ${WORK_DIR:-} ]] || rm -rf -- "$WORK_DIR"
+    exit "$status"
+}
+
+main() {
+    set -euo pipefail
+    export LC_ALL=C
+    umask 077
+    DRY_RUN=0; NO_LAUNCH=0; WORK_DIR=''; BACKUP_DIR=''
+    MOVED_ORIGINALS=(); MOVED_BACKUPS=()
+    DESKTOP_CACHE_CHANGED=0; ICON_CACHE_CHANGED=0
+    while (($#)); do
+        case $1 in
+            --dry-run) DRY_RUN=1; NO_LAUNCH=1 ;;
+            --no-launch) NO_LAUNCH=1 ;;
+            -h|--help) note 'Usage: bash install.sh [--dry-run] [--no-launch]'; note 'Dry-run only verifies downloads and builds a temporary package; no sudo, package, cache or service mutations.'; return 0 ;;
+            *) fail "Unknown option: $1"; return 1 ;;
+        esac
+        shift
+    done
+    check_platform
+    check_tools
+    check_user_bus
+    check_signature_policy
+    check_template
+    WORK_DIR=$(mktemp -d -t e-imzo-install.XXXXXXXX)
+    trap 'cleanup_installer "$?"' EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    note "Pinned manager release: $RELEASE_TAG"
+    download "$RELEASE_BASE/$MANAGER_PACKAGE" "$WORK_DIR/$MANAGER_PACKAGE"
+    download "$BACKEND_URL" "$WORK_DIR/vendor.tar.gz"
+    verify_hash "$WORK_DIR/$MANAGER_PACKAGE" "$MANAGER_SHA256"
+    verify_hash "$WORK_DIR/vendor.tar.gz" "$BACKEND_SHA256"
+    validate_archive "$WORK_DIR/vendor.tar.gz" backend "$WORK_DIR/vendor-list"
+    validate_archive "$WORK_DIR/$MANAGER_PACKAGE" manager "$WORK_DIR/manager-list"
+    extract_archive "$WORK_DIR/vendor.tar.gz" "$WORK_DIR/vendor"
+    extract_archive "$WORK_DIR/$MANAGER_PACKAGE" "$WORK_DIR/manager"
+    read_manager_metadata "$WORK_DIR/manager"
+    check_runtime_requirements
+    build_backend_package "$WORK_DIR/vendor" "$WORK_DIR/backend-stage" "$WORK_DIR/$BACKEND_PACKAGE"
+    find_local_shadows
+    if [[ $DRY_RUN == 1 ]]; then
+        note 'Dry-run successful: both hashes/archive layouts/runtime requirements verified; local native backend package built.'
+        note "Would install: $MANAGER_PACKAGE and $BACKEND_PACKAGE (one interactive pacman -U)."
+        if ((${#LOCAL_SHADOWS[@]})); then printf 'Would offer backup, only after successful installation: %s\n' "${LOCAL_SHADOWS[@]}"; fi
+        note 'No sudo, system/user configuration, service or cache changes were made. Temporary downloads will be removed.'
+        return 0
+    fi
+    capture_service_state
+    install_packages "$WORK_DIR/$MANAGER_PACKAGE" "$WORK_DIR/$BACKEND_PACKAGE"
+    migrate_local_shadows
+    activate_service
+    launch_manager
+    note 'Installation finished. Use pacman for package removal; no Java default, browser trust, keys or hardware permissions were changed.'
+}
+
+if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
+    main "$@"
+fi

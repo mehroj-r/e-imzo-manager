@@ -15,7 +15,13 @@ const SERVICE_NAME: &str = "e-imzo.service";
 
 pub fn is_service_installed() -> bool {
     let output = Command::new("systemctl")
-        .args(["--user", "is-enabled", SERVICE_NAME])
+        .args([
+            "--user",
+            "show",
+            "--property=LoadState",
+            "--value",
+            SERVICE_NAME,
+        ])
         .output()
         .ok();
 
@@ -24,7 +30,11 @@ pub fn is_service_installed() -> bool {
         None => return false,
     };
 
-    matches!(status.as_str(), "enabled")
+    is_installed_unit_state(&status)
+}
+
+fn is_installed_unit_state(state: &str) -> bool {
+    matches!(state.trim(), "loaded" | "masked")
 }
 
 pub fn is_service_active() -> bool {
@@ -97,4 +107,22 @@ pub fn check_keys_ownership() -> Result<u32> {
     let metadata = fs::metadata(path)?;
     let uid = metadata.uid();
     Ok(uid)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_installed_unit_state;
+
+    #[test]
+    fn installed_service_does_not_require_autostart() {
+        assert!(is_installed_unit_state("loaded\n"));
+        assert!(is_installed_unit_state("masked\n"));
+    }
+
+    #[test]
+    fn missing_or_failed_service_is_not_installed() {
+        assert!(!is_installed_unit_state("not-found\n"));
+        assert!(!is_installed_unit_state("error\n"));
+        assert!(!is_installed_unit_state(""));
+    }
 }
